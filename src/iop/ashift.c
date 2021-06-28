@@ -57,8 +57,8 @@
 
 #define ROTATION_RANGE 10                   // allowed min/max default range for rotation parameter
 #define ROTATION_RANGE_SOFT 20              // allowed min/max range for rotation parameter with manual adjustment
-#define LENSSHIFT_RANGE 1.0                 // allowed min/max default range for lensshift parameters
-#define LENSSHIFT_RANGE_SOFT 2.0            // allowed min/max range for lensshift parameters with manual adjustment
+#define LENSSHIFT_RANGE 1.5                 // allowed min/max default range for lensshift paramters
+#define LENSSHIFT_RANGE_SOFT 3              // allowed min/max range for lensshift paramters with manual adjustment
 #define SHEAR_RANGE 0.2                     // allowed min/max range for shear parameter
 #define SHEAR_RANGE_SOFT 0.5                // allowed min/max range for shear parameter with manual adjustment
 #define MIN_LINE_LENGTH 5                   // the minimum length of a line in pixels to be regarded as relevant
@@ -648,166 +648,106 @@ static void homography(float *homograph, const float angle, const float shift_v,
                        const float shear, const float f_length_kb, const float orthocorr, const float aspect,
                        const int width, const int height, dt_iop_ashift_homodir_t dir)
 {
-  // calculate homograph that combines all translations, rotations
+  // calculate homography that combines all translations, rotations
   // and warping into one single matrix operation.
-  // this is heavily leaning on ShiftN where the homographic matrix expects
-  // input in (y : x : 1) format. in the darktable world we want to keep the
-  // (x : y : 1) convention. therefore we need to flip coordinates first and
-  // make sure that output is in correct format after corrections are applied.
+  // The homography is H = K R S inv(K) where
+  // K is the intrinsic matrix, R is the rotation of the camera, and
+  // S is the shear transformation matrix.
 
-  const float u = width;
-  const float v = height;
+  const float ascale = sqrt(aspect);
+  const float angle_z = M_PI * angle / 180.0f;
 
-  const float phi = M_PI * angle / 180.0f;
-  const float cosi = cosf(phi);
-  const float sini = sinf(phi);
-  const float ascale = sqrtf(aspect);
+  const float cos_z = cos(angle_z);
+  const float sin_z = sin(angle_z);
 
-  // most of this comes from ShiftN
-  const float f_global = f_length_kb;
-  const float horifac = 1.0f - orthocorr / 100.0f;
-  const float exppa_v = expf(shift_v);
-  const float fdb_v = f_global / (14.4f + (v / u - 1) * 7.2f);
-  const float rad_v = fdb_v * (exppa_v - 1.0f) / (exppa_v + 1.0f);
-  const float alpha_v = CLAMP(atanf(rad_v), -1.5f, 1.5f);
-  const float rt_v = sinf(0.5f * alpha_v);
-  const float r_v = fmaxf(0.1f, 2.0f * (horifac - 1.0f) * rt_v * rt_v + 1.0f);
+  // shift_h is tan(angle_h). Our computation only depends on
+  // cos(angle_h) and sin(angle_h), using identity tan = sin/cos
+  const float inv_norm_h = 1.0f / sqrt(shift_h * shift_h + 1.0f);
+  const float cos_h = inv_norm_h;
+  const float sin_h = shift_h * inv_norm_h;
 
-  const float vertifac = 1.0f - orthocorr / 100.0f;
-  const float exppa_h = expf(shift_h);
-  const float fdb_h = f_global / (14.4f + (u / v - 1) * 7.2f);
-  const float rad_h = fdb_h * (exppa_h - 1.0f) / (exppa_h + 1.0f);
-  const float alpha_h = CLAMP(atanf(rad_h), -1.5f, 1.5f);
-  const float rt_h = sinf(0.5f * alpha_h);
-  const float r_h = fmaxf(0.1f, 2.0f * (vertifac - 1.0f) * rt_h * rt_h + 1.0f);
+  const float inv_norm_v = 1.0f / sqrt(shift_v * shift_v + 1.0f);
+  const float cos_v = inv_norm_v;
+  const float sin_v = shift_v * inv_norm_v;
 
+  // focal length should be expressed in pixels
+  // f_length_kb is expressed in mm in 35mm format equivalent
+  // so we have to convert to pixels
+  const float f_length = f_length_kb * width / 36.0;
 
-  // three intermediate buffers for matrix calculation ...
-  float m1[3][3], m2[3][3], m3[3][3];
-
+  // four intermediate buffers for matrix calculation ...
+  float m1[3][3], m2[3][3], m3[3][3], m4[3][3];
   // ... and some pointers to handle them more intuitively
   float (*mwork)[3] = m1;
   float (*minput)[3] = m2;
   float (*moutput)[3] = m3;
+  float (*intrinsic)[3] = m4;
 
-  // Step 1: flip x and y coordinates (see above)
-  memset(minput, 0, sizeof(float) * 9);
-  minput[0][1] = 1.0f;
-  minput[1][0] = 1.0f;
-  minput[2][2] = 1.0f;
+  // Step 0: Compute intrinsic calibration
+  memset(intrinsic, 0, 9 * sizeof(float));
+  intrinsic[0][0] = f_length * ascale;
+  intrinsic[1][1] = f_length / ascale;
+  intrinsic[0][2] = 0.5f * width;
+  intrinsic[1][2] = 0.5f * height;
+  intrinsic[2][2] = 1.0f;
 
+  // Compute inverse intrinsic
+  mat3inv((float *)minput, (float *)intrinsic);
+
+  // Step 1: apply skew/shear
+  memset(mwork, 0, 9 * sizeof(float));
+  mwork[0][0] = 1.0f;
+  mwork[1][1] = 1.0f;
+  mwork[2][2] = 1.0f;
+  mwork[0][1] = shear;
+  mat3mul((float *)moutput, (float *)mwork, (float *)minput);
 
   // Step 2: rotation of image around its center
-  memset(mwork, 0, sizeof(float) * 9);
-  mwork[0][0] = cosi;
-  mwork[0][1] = -sini;
-  mwork[1][0] = sini;
-  mwork[1][1] = cosi;
-  mwork[0][2] = -0.5f * v * cosi + 0.5f * u * sini + 0.5f * v;
-  mwork[1][2] = -0.5f * v * sini - 0.5f * u * cosi + 0.5f * u;
+  memset(mwork, 0, 9 * sizeof(float));
+  mwork[0][0] = cos_z;
+  mwork[0][1] = -sin_z;
+  mwork[1][0] = sin_z;
+  mwork[1][1] = cos_z;
   mwork[2][2] = 1.0f;
 
+  // moutput (of last calculation) -> minput
+  MAT3SWAP(minput, moutput);
   // multiply mwork * minput -> moutput
   mat3mul((float *)moutput, (float *)mwork, (float *)minput);
 
-
-  // Step 3: apply shearing
-  memset(mwork, 0, sizeof(float) * 9);
+  // Step 3: vertical shift is the rotation about x
+  memset(mwork, 0, 9 * sizeof(float));
+  mwork[1][1] = cos_v;
+  mwork[1][2] = -sin_v;
+  mwork[2][1] = sin_v;
+  mwork[2][2] = cos_v;
   mwork[0][0] = 1.0f;
-  mwork[0][1] = shear;
+
+  // moutput (of last calculation) -> minput
+  MAT3SWAP(minput, moutput);
+  // multiply mwork * minput -> moutput
+  mat3mul((float *)moutput, (float *)mwork, (float *)minput);
+
+  // Step 4: horizontal shift is the rotation about y
+  memset(mwork, 0, 9 * sizeof(float));
+  mwork[0][0] = cos_h;
+  mwork[0][2] = -sin_h;
+  mwork[2][0] = sin_h;
+  mwork[2][2] = cos_h;
   mwork[1][1] = 1.0f;
-  mwork[1][0] = shear;
-  mwork[2][2] = 1.0f;
 
   // moutput (of last calculation) -> minput
   MAT3SWAP(minput, moutput);
   // multiply mwork * minput -> moutput
   mat3mul((float *)moutput, (float *)mwork, (float *)minput);
 
-
-  // Step 4: apply vertical lens shift effect
-  memset(mwork, 0, sizeof(float) * 9);
-  mwork[0][0] = exppa_v;
-  mwork[1][0] = 0.5f * ((exppa_v - 1.0f) * u) / v;
-  mwork[1][1] = 2.0f * exppa_v / (exppa_v + 1.0f);
-  mwork[1][2] = -0.5f * ((exppa_v - 1.0f) * u) / (exppa_v + 1.0f);
-  mwork[2][0] = (exppa_v - 1.0f) / v;
-  mwork[2][2] = 1.0f;
-
+  // Step 5: apply intrinsic
   // moutput (of last calculation) -> minput
   MAT3SWAP(minput, moutput);
   // multiply mwork * minput -> moutput
-  mat3mul((float *)moutput, (float *)mwork, (float *)minput);
+  mat3mul((float *)moutput, (float *)intrinsic, (float *)minput);
 
-
-  // Step 5: horizontal compression
-  memset(mwork, 0, sizeof(float) * 9);
-  mwork[0][0] = 1.0f;
-  mwork[1][1] = r_v;
-  mwork[1][2] = 0.5f * u * (1.0f - r_v);
-  mwork[2][2] = 1.0f;
-
-  // moutput (of last calculation) -> minput
-  MAT3SWAP(minput, moutput);
-  // multiply mwork * minput -> moutput
-  mat3mul((float *)moutput, (float *)mwork, (float *)minput);
-
-
-  // Step 6: flip x and y back again
-  memset(mwork, 0, sizeof(float) * 9);
-  mwork[0][1] = 1.0f;
-  mwork[1][0] = 1.0f;
-  mwork[2][2] = 1.0f;
-
-  // moutput (of last calculation) -> minput
-  MAT3SWAP(minput, moutput);
-  // multiply mwork * minput -> moutput
-  mat3mul((float *)moutput, (float *)mwork, (float *)minput);
-
-
-  // from here output vectors would be in (x : y : 1) format
-
-  // Step 7: now we can apply horizontal lens shift with the same matrix format as above
-  memset(mwork, 0, sizeof(float) * 9);
-  mwork[0][0] = exppa_h;
-  mwork[1][0] = 0.5f * ((exppa_h - 1.0f) * v) / u;
-  mwork[1][1] = 2.0f * exppa_h / (exppa_h + 1.0f);
-  mwork[1][2] = -0.5f * ((exppa_h - 1.0f) * v) / (exppa_h + 1.0f);
-  mwork[2][0] = (exppa_h - 1.0f) / u;
-  mwork[2][2] = 1.0f;
-
-  // moutput (of last calculation) -> minput
-  MAT3SWAP(minput, moutput);
-  // multiply mwork * minput -> moutput
-  mat3mul((float *)moutput, (float *)mwork, (float *)minput);
-
-
-  // Step 8: vertical compression
-  memset(mwork, 0, sizeof(float) * 9);
-  mwork[0][0] = 1.0f;
-  mwork[1][1] = r_h;
-  mwork[1][2] = 0.5f * v * (1.0f - r_h);
-  mwork[2][2] = 1.0f;
-
-  // moutput (of last calculation) -> minput
-  MAT3SWAP(minput, moutput);
-  // multiply mwork * minput -> moutput
-  mat3mul((float *)moutput, (float *)mwork, (float *)minput);
-
-
-  // Step 9: apply aspect ratio scaling
-  memset(mwork, 0, sizeof(float) * 9);
-  mwork[0][0] = 1.0f * ascale;
-  mwork[1][1] = 1.0f / ascale;
-  mwork[2][2] = 1.0f;
-
-  // moutput (of last calculation) -> minput
-  MAT3SWAP(minput, moutput);
-  // multiply mwork * minput -> moutput
-  mat3mul((float *)moutput, (float *)mwork, (float *)minput);
-
-
-  // Step 10: find x/y offsets and apply according correction so that
+  // Step 6: find x/y offsets and apply according correction so that
   // no negative coordinates occur in output vector
   float umin = FLT_MAX, vmin = FLT_MAX;
   // visit all four corners
@@ -2252,7 +2192,7 @@ static dt_iop_ashift_nmsresult_t nmsfit(dt_iop_module_t *module, dt_iop_ashift_p
       yM = fmax(yM, po[1]);
     }
 
-  if((xM - xm) * (yM - ym) > 4.0f * fit.width * fit.height)
+  if((xM - xm) * (yM - ym) > 8.0f * fit.width * fit.height)
   {
 #ifdef ASHIFT_DEBUG
     printf("optimization not successful: degenerate case with area growth factor (%f) exceeding limits\n",
@@ -4455,8 +4395,9 @@ void reload_defaults(dt_iop_module_t *module)
   float crop_factor = 1.0f;
 
   // try to get information on orientation, focal length and crop factor from image data
-  if(module->dev)
+  if(module->dev || true)
   {
+    printf("module->dev is true\n");
     const dt_image_t *img = &module->dev->image_storage;
     // orientation only needed as a-priori information to correctly label some sliders
     // before pixelpipe has been set up. later we will get a definite result by
@@ -4466,6 +4407,7 @@ void reload_defaults(dt_iop_module_t *module)
 
     // focal length should be available in exif data if lens is electronically coupled to the camera
     f_length = isfinite(img->exif_focal_length) && img->exif_focal_length > 0.0f ? img->exif_focal_length : f_length;
+    printf("image focal length: %f\n", img->exif_focal_length);
     // crop factor of the camera is often not available and user will need to set it manually in the gui
     crop_factor = isfinite(img->exif_crop) && img->exif_crop > 0.0f ? img->exif_crop : crop_factor;
   }
